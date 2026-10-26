@@ -1,12 +1,28 @@
-import { lazy, Suspense, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, type TouchEvent as ReactTouchEvent } from 'react'
 import Papa from 'papaparse'
-import { Boxes, Database, Download, Filter, LayoutDashboard, Network, Search, Settings2, Sun, Moon, Upload, X } from 'lucide-react'
+import { Boxes, Database, Download, Filter, LayoutDashboard, Maximize2, Minimize2, Network, RotateCcw, Search, Settings2, Sun, Moon, Upload, X } from 'lucide-react'
 import { AdminDashboard, SupportDashboard } from './RoleDashboards'
+import { createAxisTraces } from './graphAxes'
+import { createCurvedNeighborTrace } from './graphRelations'
 const Plot = lazy(() => import('./Plot3d'))
 import { compare, csvEscape, detectColumns, nearestEdges, parseRows, parseVector, projectPca, search, type Metric, type Ranked, type RecordRow } from './core'
 
 type Parsed = { name: string; headers: string[]; rows: Record<string, string>[] }
 const formatNumber = (n: number, digits = 3) => Number.isFinite(n) ? n.toFixed(digits) : '—'
+type CameraState={zoom:number;center:{x:number;y:number;z:number}}
+const INITIAL_CAMERA_STATE:CameraState={zoom:1,center:{x:0,y:0,z:0}}
+function zoomCameraAtPoint(current:CameraState,requestedZoom:number,screenX:number,screenY:number):CameraState{
+  const zoom=Math.max(.35,Math.min(6,requestedZoom)),fraction=1-current.zoom/zoom
+  if(Math.abs(fraction)<1e-8)return current
+  const eye={x:1.55,y:1.1,z:1.55},eyeLength=Math.hypot(eye.x,eye.y,eye.z),horizontalLength=Math.hypot(eye.x,eye.z)
+  const view={x:-eye.x/eyeLength,y:-eye.y/eyeLength,z:-eye.z/eyeLength}
+  const right={x:eye.z/horizontalLength,y:0,z:-eye.x/horizontalLength}
+  const up={x:right.y*view.z-right.z*view.y,y:right.z*view.x-right.x*view.z,z:right.x*view.y-right.y*view.x}
+  const focusScale=eyeLength/current.zoom*.42
+  const offset={x:(right.x*screenX+up.x*screenY)*focusScale,y:(right.y*screenX+up.y*screenY)*focusScale,z:(right.z*screenX+up.z*screenY)*focusScale}
+  const clamp=(value:number)=>Math.max(-4,Math.min(4,value))
+  return {zoom,center:{x:clamp(current.center.x+offset.x*fraction),y:clamp(current.center.y+offset.y*fraction),z:clamp(current.center.z+offset.z*fraction)}}
+}
 const sampleRecords: RecordRow[] = [
   ['auth-flow','OAuth token refresh and session rotation','identity',[0.92,0.88,0.08,0.12,0.18]],
   ['login-mfa','Multi-factor authentication with passkeys','identity',[0.86,0.81,0.14,0.13,0.21]],
@@ -43,6 +59,15 @@ export default function App() {
   const [showFilters,setShowFilters] = useState(false)
   const [relations,setRelations] = useState(false)
   const [edgeK,setEdgeK] = useState(3)
+  const [yawDegrees,setYawDegrees] = useState(0)
+  const [isFullscreen,setIsFullscreen] = useState(false)
+  const [isolateMatches,setIsolateMatches] = useState(false)
+  const [cameraState,setCameraState] = useState<CameraState>(INITIAL_CAMERA_STATE)
+  const graphPanelRef = useRef<HTMLDivElement>(null)
+  const plotShellRef = useRef<HTMLElement>(null)
+  const pinchStartRef = useRef<{distance:number;camera:CameraState}|null>(null)
+  const dragStartRef = useRef<{pointerId:number;startX:number;startYaw:number;moved:boolean}|null>(null)
+  const suppressPlotClickRef = useRef(false)
   const [showImport,setShowImport] = useState(false)
   const [showManage,setShowManage] = useState(false)
   const [showSettings,setShowSettings] = useState(false)
@@ -50,30 +75,97 @@ export default function App() {
   const [history,setHistory] = useState<{query:string;metric:Metric;count:number;time:string}[]>([])
   const [drag,setDrag] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  useEffect(()=>{
+    const syncFullscreen=()=>setIsFullscreen(document.fullscreenElement===graphPanelRef.current)
+    document.addEventListener('fullscreenchange',syncFullscreen)
+    return ()=>document.removeEventListener('fullscreenchange',syncFullscreen)
+  },[])
+  useEffect(()=>{
+    const onMove=(event:PointerEvent)=>{
+      const gesture=dragStartRef.current
+      if(!gesture||gesture.pointerId!==event.pointerId)return
+      const deltaX=event.clientX-gesture.startX
+      if(Math.abs(deltaX)>3)gesture.moved=true
+      if(!gesture.moved)return
+      event.preventDefault()
+      event.stopPropagation()
+      setYawDegrees((gesture.startYaw+deltaX*.5+360)%360)
+    }
+    const onUp=(event:PointerEvent)=>{
+      const gesture=dragStartRef.current
+      if(!gesture||gesture.pointerId!==event.pointerId)return
+      suppressPlotClickRef.current=gesture.moved
+      if(gesture.moved)window.setTimeout(()=>{suppressPlotClickRef.current=false},0)
+      dragStartRef.current=null
+    }
+    window.addEventListener('pointermove',onMove,{capture:true,passive:false})
+    window.addEventListener('pointerup',onUp,true)
+    window.addEventListener('pointercancel',onUp,true)
+    return ()=>{
+      window.removeEventListener('pointermove',onMove,true)
+      window.removeEventListener('pointerup',onUp,true)
+      window.removeEventListener('pointercancel',onUp,true)
+    }
+  },[])
   const picked = records.find((r)=>r.id===selected) ?? null
   const metadataFields = Object.keys(records[0]?.metadata??{})
   const activeField = metadataFields.includes(filterField)?filterField:metadataFields[0]??''
   const categories = [...new Set(records.map(r=>r.metadata[activeField]).filter(Boolean))]
   const filtered = category==='all' ? records : records.filter(r=>r.metadata[activeField]===category)
-  const renderedRecords = useMemo(()=>filtered.length<=900?filtered:filtered.filter((_,i)=>i%Math.ceil(filtered.length/900)===0).slice(0,900),[filtered])
+  const renderedRecords = useMemo(()=>{
+    if(filtered.length<=900)return filtered
+    const visible=filtered.filter((_,i)=>i%Math.ceil(filtered.length/900)===0).slice(0,900)
+    const visibleIds=new Set(visible.map(record=>record.id))
+    const filteredById=new Map(filtered.map(record=>[record.id,record]))
+    // Keep matches and the selected point in the sampled projection so every result can be located.
+    for(const result of results){
+      const record=filteredById.get(result.record.id)
+      if(record&&!visibleIds.has(record.id)){visible.push(record);visibleIds.add(record.id)}
+    }
+    const selectedRecord=selected?filteredById.get(selected):undefined
+    if(selectedRecord&&!visibleIds.has(selectedRecord.id))visible.push(selectedRecord)
+    return visible
+  },[filtered,results,selected])
+  const resultIds = useMemo(()=>new Set(results.map(result=>result.record.id)),[results])
+  const resultById = useMemo(()=>new Map(results.map(result=>[result.record.id,result])),[results])
+  const graphRecords = useMemo(()=>isolateMatches&&resultIds.size?renderedRecords.filter(record=>resultIds.has(record.id)):renderedRecords,[renderedRecords,resultIds,isolateMatches])
+  const graphRecordIds = useMemo(()=>new Set(graphRecords.map(record=>record.id)),[graphRecords])
   const projection = useMemo(()=>projectPca(renderedRecords),[renderedRecords])
-  const projectionById = useMemo(()=>new Map(projection.map(p=>[p.id,p])),[projection])
-  const resultById = new Map(results.map(r=>[r.record.id,r]))
-  const edges = useMemo(()=>relations?nearestEdges(renderedRecords,metric,edgeK):[],[renderedRecords,metric,edgeK,relations])
+  const originalProjectionById = useMemo(()=>new Map(projection.map(point=>[point.id,point])),[projection])
+  // Rotate projected points around logical Y while preserving each point's Y coordinate.
+  const rotatedProjection = useMemo(()=>{
+    const radians=yawDegrees*Math.PI/180,cos=Math.cos(radians),sin=Math.sin(radians)
+    return projection.map(point=>({...point,x:point.x*cos+point.z*sin,z:-point.x*sin+point.z*cos}))
+  },[projection,yawDegrees])
+  const projectionById = useMemo(()=>new Map(rotatedProjection.map(point=>[point.id,point])),[rotatedProjection])
+  const visibleProjection = rotatedProjection.filter(point=>graphRecordIds.has(point.id))
+  const edges = useMemo(()=>relations?nearestEdges(graphRecords,metric,edgeK):[],[graphRecords,metric,edgeK,relations])
   const selectedNeighbors = picked ? records.filter(r=>r.id!==picked.id).flatMap(r=>{try{return [{r,score:compare(picked.embedding,r.embedding,metric)}]}catch{return []}}).sort((a,b)=>metric==='euclidean'?a.score-b.score:b.score-a.score).slice(0,4) : []
   const avgNorm = records.length ? records.reduce((s,r)=>s+r.norm,0)/records.length : 0
   const dim = records[0]?.embedding.length ?? 0
+  const plotExtent=Math.max(1e-9,...visibleProjection.map(point=>Math.hypot(point.x,point.z)),...visibleProjection.map(point=>Math.abs(point.y)))*1.08
   const plotData:any[] = []
-  if (edges.length) {
-    const ex:number[]=[],ey:number[]=[],ez:number[]=[]
-    edges.forEach(e=>{const a=projectionById.get(e.source),b=projectionById.get(e.target);if(a&&b){ex.push(a.x,b.x,NaN);ey.push(a.y,b.y,NaN);ez.push(a.z,b.z,NaN)}})
-    plotData.push({type:'scatter3d',mode:'lines',x:ex,y:ey,z:ez,hoverinfo:'skip',line:{color:'rgba(119,151,143,.26)',width:2},name:'Computed neighbors'})
+  const pointData=(record:RecordRow)=>[record.id,record.text.slice(0,88),record.metadata[activeField]??'',formatNumber(record.norm,2)]
+  const categoryColor=(record:RecordRow)=>record.metadata[activeField]?['#477b70','#708294','#a2865b'][Math.max(0,categories.indexOf(record.metadata[activeField]))%3]:'#77857e'
+  const backgroundPoints=graphRecords.filter(record=>!resultIds.has(record.id)&&record.id!==selected)
+  const highlightedPoints=graphRecords.filter(record=>resultIds.has(record.id)||record.id===selected)
+  const graphGuides=createAxisTraces(plotExtent,yawDegrees,light)
+  plotData.push(graphGuides.grid)
+  if(edges.length)plotData.push(createCurvedNeighborTrace(edges,originalProjectionById,yawDegrees,light))
+  plotData.push(...graphGuides.axes)
+  if(backgroundPoints.length){
+    const points=backgroundPoints.map(record=>projectionById.get(record.id)!)
+    plotData.push({type:'scatter3d',mode:'markers',x:points.map(point=>point.x),y:points.map(point=>point.y),z:points.map(point=>point.z),customdata:backgroundPoints.map(pointData),hovertemplate:'<b>Record ID: %{customdata[0]}</b><br>%{customdata[1]}<br>Group: %{customdata[2]}<br>Original norm: %{customdata[3]}<extra></extra>',hoverlabel:{bgcolor:light?'#fffdf8':'#172321',bordercolor:light?'#a8b9ae':'#526b62',font:{color:light?'#23332d':'#edf3f7',size:12,family:'Aptos, Segoe UI, sans-serif'}},marker:{size:results.length?4.5:5,color:backgroundPoints.map(categoryColor),opacity:results.length ? 0.26 : 0.78,line:{width:0}},name:'Embeddings'})
   }
-  if (projection.length) {
-    plotData.push({type:'scatter3d',mode:'markers',x:projection.map(p=>p.x),y:projection.map(p=>p.y),z:projection.map(p=>p.z),customdata:renderedRecords.map(r=>[r.id,r.text.slice(0,88),r.metadata[activeField]??'',formatNumber(r.norm,2)]),text:renderedRecords.map(r=>r.id),hoverlabel:{bgcolor:light?"#fffdf8":"#172321",bordercolor:light?"#a8b9ae":"#526b62",font:{color:light?"#23332d":"#edf3f7",size:12,family:"Aptos, Segoe UI, sans-serif"}},hovertemplate:'<b>%{customdata[0]}</b><br>%{customdata[1]}<br>Group: %{customdata[2]}<br>Original norm: %{customdata[3]}<extra></extra>',marker:{size:renderedRecords.map(r=>r.id===selected?9:resultById.has(r.id)?7:5),color:renderedRecords.map(r=>r.id===selected?'#d57845':resultById.has(r.id)?'#167762':r.metadata[activeField]?['#477b70','#708294','#a2865b'][Math.max(0,categories.indexOf(r.metadata[activeField]))%3]:'#77857e'),opacity:0.76,line:{width:renderedRecords.map(r=>r.id===selected?2:resultById.has(r.id)?1:0),color:renderedRecords.map(r=>r.id===selected?'#974d2d':resultById.has(r.id)?'#fffdf8':'rgba(0,0,0,0)')}},name:'Embeddings'})
+  if(highlightedPoints.length){
+    const points=highlightedPoints.map(record=>projectionById.get(record.id)!)
+    // A soft outer marker gives matches a visible halo without obscuring dense neighborhoods.
+    plotData.push({type:'scatter3d',mode:'markers',x:points.map(point=>point.x),y:points.map(point=>point.y),z:points.map(point=>point.z),hoverinfo:'skip',showlegend:false,marker:{size:highlightedPoints.map(record=>record.id===selected?23:18),color:highlightedPoints.map(record=>record.id===selected?'rgba(199,93,59,.18)':'rgba(20,123,101,.18)'),opacity:1,line:{width:0}},name:'Search result halo'})
+    plotData.push({type:'scatter3d',mode:'markers',x:points.map(point=>point.x),y:points.map(point=>point.y),z:points.map(point=>point.z),customdata:highlightedPoints.map(pointData),hovertemplate:'<b>%{customdata[0]}</b><br>%{customdata[1]}<br>Group: %{customdata[2]}<br>Original norm: %{customdata[3]}<extra></extra>',hoverlabel:{bgcolor:light?'#fffdf8':'#172321',bordercolor:light?'#a8b9ae':'#526b62',font:{color:light?'#23332d':'#edf3f7',size:12,family:'Aptos, Segoe UI, sans-serif'}},marker:{size:highlightedPoints.map(record=>record.id===selected?13:10),color:highlightedPoints.map(record=>record.id===selected?'#c75d3b':'#147b65'),opacity:1,line:{width:2,color:light?'#fffdf8':'#e7eee8'}},name:results.length?'Search matches':'Selected record'})
   }
-  const plotLayout:any={autosize:true,paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:0,r:0,t:4,b:0},showlegend:false,scene:{bgcolor:'rgba(0,0,0,0)',xaxis:{title:'PC 1',color:light?'#69766e':'#a3b2a8',gridcolor:light?'rgba(61,88,73,.12)':'rgba(198,219,201,.12)',zerolinecolor:light?'rgba(61,88,73,.18)':'rgba(198,219,201,.18)',showbackground:false},yaxis:{title:'PC 2',color:light?'#69766e':'#a3b2a8',gridcolor:light?'rgba(61,88,73,.12)':'rgba(198,219,201,.12)',zerolinecolor:light?'rgba(61,88,73,.18)':'rgba(198,219,201,.18)',showbackground:false},zaxis:{title:'PC 3',color:light?'#69766e':'#a3b2a8',gridcolor:light?'rgba(61,88,73,.12)':'rgba(198,219,201,.12)',zerolinecolor:light?'rgba(61,88,73,.18)':'rgba(198,219,201,.18)',showbackground:false},camera:{eye:{x:1.45,y:1.55,z:1.08}}},uirevision:'vectorscope'}
-  const plotConfig:any={displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d']}
+
+  const plotLayout:any={autosize:true,paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',margin:{l:0,r:0,t:4,b:0},showlegend:false,scene:{bgcolor:'rgba(0,0,0,0)',aspectmode:'cube',dragmode:false,xaxis:{visible:false,range:[-plotExtent*1.16,plotExtent*1.16]},yaxis:{visible:false,range:[-plotExtent*1.16,plotExtent*1.16]},zaxis:{visible:false,range:[-plotExtent*1.16,plotExtent*1.16]},camera:{eye:{x:1.55/cameraState.zoom,y:1.1/cameraState.zoom,z:1.55/cameraState.zoom},center:cameraState.center,up:{x:0,y:1,z:0}}},uirevision:'vectorscope'}
+  const plotConfig:any={displaylogo:false,responsive:true,scrollZoom:false,modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','orbitRotation','tableRotation']}
 
   function navigate(name:string) {
     setNav(name);setShowFilters(false)
@@ -118,8 +210,8 @@ export default function App() {
   function loadSample() {setRecords(sampleRecords);setDatasetName('Product architecture sample · synthetic');setResults([]);setSelected(null);setCategory('all');setFilterField('category');setError('')}
   function runSearch(vectorText=queryVector,exclude?:string) {
     setError('')
-    try {const q=parseVector(vectorText);const next=search(records,q,metric,topK,threshold,exclude,category==='all'?undefined:category,activeField);setResults(next);if(next.length)setSelected(next[0].record.id);setHistory(h=>[{query:vectorText.slice(0,72),metric,count:next.length,time:new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})},...h].slice(0,8))}
-    catch(e){setError((e as Error).message);setResults([])}
+    try {const q=parseVector(vectorText);const next=search(records,q,metric,topK,threshold,exclude,category==='all'?undefined:category,activeField);setResults(next);setIsolateMatches(next.length>0);if(next.length)setSelected(next[0].record.id);setHistory(h=>[{query:vectorText.slice(0,72),metric,count:next.length,time:new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})},...h].slice(0,8))}
+    catch(e){setError((e as Error).message);setResults([]);setIsolateMatches(false)}
   }
   function exportResults() {
     if(!results.length)return
@@ -129,7 +221,54 @@ export default function App() {
   }
   function download(content:string,name:string,type:string){const url=URL.createObjectURL(new Blob([content],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
   function downloadIssues(){download(['issue',...issues].map(csvEscape).join('\n'),'vectorscope-import-issues.csv','text/csv')}
-  function handlePlotClick(event:any){const point=event.points?.[0];const id=point?.customdata?.[0];if(id)setSelected(String(id))}
+  function handleGraphPointerDown(event:ReactPointerEvent<HTMLDivElement>){
+    if(event.button!==0)return
+    const target=event.target
+    if(target instanceof HTMLElement&&target.closest('button,input,select,a,.modebar'))return
+    dragStartRef.current={pointerId:event.pointerId,startX:event.clientX,startYaw:yawDegrees,moved:false}
+  }
+  function plotScreenPosition(clientX:number,clientY:number){
+    const bounds=plotShellRef.current?.getBoundingClientRect()
+    if(!bounds||bounds.width===0||bounds.height===0)return null
+    return {x:((clientX-bounds.left)/bounds.width)*2-1,y:1-((clientY-bounds.top)/bounds.height)*2}
+  }
+  function handleGraphWheel(event:ReactWheelEvent<HTMLDivElement>){
+    const target=event.target
+    if(!(target instanceof HTMLElement)||!target.closest('.plot-shell'))return
+    const point=plotScreenPosition(event.clientX,event.clientY)
+    if(!point)return
+    event.preventDefault();event.stopPropagation()
+    setCameraState(current=>zoomCameraAtPoint(current,current.zoom*Math.exp(-event.deltaY*.0012),point.x,point.y))
+  }
+  function handleGraphTouchStart(event:ReactTouchEvent<HTMLDivElement>){
+    if(event.touches.length!==2||!plotShellRef.current?.contains(event.target as Node))return
+    const [a,b]=[event.touches[0],event.touches[1]]
+    pinchStartRef.current={distance:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),camera:cameraState}
+    dragStartRef.current=null
+  }
+  function handleGraphTouchMove(event:ReactTouchEvent<HTMLDivElement>){
+    const start=pinchStartRef.current
+    if(!start||event.touches.length!==2)return
+    const [a,b]=[event.touches[0],event.touches[1]],distance=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY)
+    const point=plotScreenPosition((a.clientX+b.clientX)/2,(a.clientY+b.clientY)/2)
+    if(!point)return
+    event.preventDefault();event.stopPropagation()
+    setCameraState(zoomCameraAtPoint(start.camera,start.camera.zoom*distance/start.distance,point.x,point.y))
+  }
+  function handleGraphTouchEnd(event:ReactTouchEvent<HTMLDivElement>){if(event.touches.length<2)pinchStartRef.current=null}
+  function handlePlotClick(event:any){
+    if(suppressPlotClickRef.current){suppressPlotClickRef.current=false;return}
+    const recordId=event.points?.[0]?.customdata?.[0]
+    if(recordId!==undefined&&recordId!==null)setSelected(String(recordId))
+  }
+  async function toggleGraphFullscreen(){
+    const graph=graphPanelRef.current
+    if(!graph)return
+    try{
+      if(document.fullscreenElement)await document.exitFullscreen()
+      else await graph.requestFullscreen()
+    }catch{setError('Full-screen mode is unavailable in this browser.')}
+  }
   function exportProjection(){download(['id,x,y,z',...projection.map(p=>`${csvEscape(p.id)},${p.x},${p.y},${p.z}`)].join('\n'),'vectorscope-pca-projection.csv','text/csv')}
 
   return <div className={light?'app light':'app'} onDragOver={(e)=>{e.preventDefault();setDrag(true)}} onDragLeave={(e)=>{if(e.currentTarget===e.target)setDrag(false)}} onDrop={(e)=>{e.preventDefault();setDrag(false);openFile(e.dataTransfer.files[0])}}>
@@ -159,21 +298,22 @@ export default function App() {
       </aside>
       <main className="workspace">{mode==='analytics'?<>
         <div className="workspace-head"><div><div className="breadcrumbs">EXPLORATION <span>/</span> {nav.toUpperCase()}</div><h1>{nav==='Embedding Explorer'?'Embedding landscape':nav==='Overview'?'Dataset overview':nav}</h1><p>{records.length?'Inspect neighborhoods, then verify each match against its original vector.':'Load a dataset to begin exploring its vector space.'}</p></div><div className="workspace-tools"><button className="tool-button" aria-pressed={showFilters} aria-expanded={showFilters} onClick={()=>setShowFilters(!showFilters)} title="Open dataset filters"><Filter size={14}/><span>Filters</span></button><button className={relations?'tool-button selected':'tool-button'} aria-pressed={relations} onClick={()=>setRelations(!relations)} disabled={!records.length} title="Toggle computed nearest-neighbor edges"><Network size={14}/><span>Relations</span></button><button className="tool-button" onClick={exportProjection} disabled={!projection.length} title="Export PCA projection"><Download size={14}/><span>Export</span></button></div></div>
-        <div className="viz-bar"><div className="viz-mode"><span className="live-dot"></span><strong>3D embedding map</strong><span className="mode-divider"></span><span className="algo-pill">PCA</span><span className="mode-note">Search always uses original vectors</span></div><div className="viz-actions">{categories.length?categories.slice(0,3).map((name,i)=><span className="legend-item" key={name}><i className="legend-dot" style={{background:['#477b70','#708294','#a2865b'][i]}}></i>{name}</span>):<span className="legend-item"><i className="legend-dot blue"></i>Records</span>}<span className="legend-divider"></span><button className="icon-button tiny" title="Reset selection" onClick={()=>setSelected(null)}><X size={13}/></button></div></div>
-        <section className="plot-shell" aria-label="Interactive three dimensional embedding visualization">
+        <div ref={graphPanelRef} className={isFullscreen?'visualization-panel is-fullscreen':'visualization-panel'} onPointerDownCapture={handleGraphPointerDown} onWheelCapture={handleGraphWheel} onTouchStartCapture={handleGraphTouchStart} onTouchMoveCapture={handleGraphTouchMove} onTouchEndCapture={handleGraphTouchEnd}><div className="viz-bar"><div className="viz-mode"><span className="live-dot"></span><strong>3D embedding map</strong><span className="mode-divider"></span><span className="algo-pill">PCA</span><span className="mode-note">Search always uses original vectors</span></div><div className="viz-actions">{categories.length?categories.slice(0,3).map((name,i)=><span className="legend-item" key={name}><i className="legend-dot" style={{background:['#477b70','#708294','#a2865b'][i]}}></i>{name}</span>):<span className="legend-item"><i className="legend-dot blue"></i>Records</span>}<span className="legend-divider"></span>{results.length>0&&<button className={isolateMatches?'tool-button selected isolation-toggle':'tool-button isolation-toggle'} type="button" aria-pressed={isolateMatches} onClick={()=>setIsolateMatches(value=>!value)} title={isolateMatches?'Restore every graph point':'Show only search matches'} aria-label={isolateMatches?'Show all graph points':'Isolate matching search points'}>{isolateMatches?'Show all':'Isolate matches'}</button>}<button className="icon-button tiny" title="Reset selection" onClick={()=>setSelected(null)}><X size={13}/></button><button className="icon-button" type="button" title="Reset zoom and rotation" aria-label="Reset zoom and rotation" onClick={()=>{setCameraState(INITIAL_CAMERA_STATE);setYawDegrees(0)}}><RotateCcw size={15}/></button><button className="icon-button" type="button" aria-label={isFullscreen?'Exit full screen':'Enter full screen'} aria-pressed={isFullscreen} title={isFullscreen?'Exit full screen':'Enter full screen'} onClick={toggleGraphFullscreen}>{isFullscreen?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button></div></div>
+        <div className="axis-rotation-control"><label htmlFor="axis-yaw">Rotate around fixed Y</label><input id="axis-yaw" aria-label="Rotate plotted embeddings around the fixed vertical Y axis" type="range" min="0" max="360" step="1" value={yawDegrees} onChange={e=>setYawDegrees(Number(e.target.value))}/><output htmlFor="axis-yaw">{yawDegrees}°</output><button className="text-button" type="button" onClick={()=>setYawDegrees(0)}>Reset</button></div>
+        <section ref={plotShellRef} className="plot-shell" aria-label="Interactive three dimensional embedding visualization">
           {projection.length?<>
             <Suspense fallback={<div className="plot-loading">Preparing the 3D renderer…</div>}><Plot key={`${records.length}-${category}`} data={plotData} layout={plotLayout} config={plotConfig} useResizeHandler style={{width:'100%',height:'100%'}} onClick={handlePlotClick} onSelected={(ev:any)=>{const id=ev.points?.[0]?.customdata?.[0];if(id)setSelected(String(id))}} /></Suspense>
-            <div className="plot-hint"><span className="mouse-icon">⌖</span>Drag to rotate <i></i> Scroll to zoom <i></i> Click a point to inspect</div>
+            <div className="plot-hint">Drag or use the Y control · Scroll to zoom · Click a point to inspect</div>
             <div className="plot-coordinates"><span>DISPLAY SPACE</span><b>3 principal components</b><small>Relative position is approximate; ranking uses {metric} in {dim}D.</small></div>
             {relations&&<div className="edge-count">{edges.length} undirected neighbor links · k={edgeK}<select aria-label="Number of neighbors" value={edgeK} onChange={e=>setEdgeK(Number(e.target.value))}><option value={1}>1</option><option value={3}>3</option><option value={5}>5</option></select></div>}
           </>:<div className="plot-empty"><div className="empty-orbit"><span></span><span></span><span></span></div><strong>Your vector field starts here</strong><p>Import an embeddings CSV to project your records into a navigable 3D space.</p><button className="button primary" onClick={()=>fileRef.current?.click()}>Import embeddings</button><button className="text-button" onClick={loadSample}>Or explore a labeled sample</button></div>}
         </section>
-        <div className="workspace-footer"><span><i className="footer-led"></i>Projection: <b>PCA</b></span><span>Original dimensions: <b>{dim||'—'}</b></span><span>Points in view: <b>{filtered.length>renderedRecords.length?`${renderedRecords.length.toLocaleString()} / ${filtered.length.toLocaleString()}`:renderedRecords.length.toLocaleString()}</b></span><span className="footer-spacer"></span><span className="footer-disclaimer">3D distance does not represent exact similarity</span></div>
+        <div className="workspace-footer"><span><i className="footer-led"></i>Projection: <b>PCA</b></span><span>Original dimensions: <b>{dim||'—'}</b></span><span>Points in view: <b>{filtered.length>renderedRecords.length?`${renderedRecords.length.toLocaleString()} / ${filtered.length.toLocaleString()}`:renderedRecords.length.toLocaleString()}</b></span><span className="footer-spacer"></span><span className="footer-disclaimer">3D distance does not represent exact similarity</span></div></div>
         {error&&<div className="inline-error" role="alert"><span>!</span>{error}<button onClick={()=>setError('')} aria-label="Dismiss error">×</button></div>}
         <section className="search-dock">
           <div className="dock-top"><div className="dock-title"><span className="search-mark">⌕</span><div><strong>Find similar vectors</strong><small>Compare a query against original embeddings</small></div></div><div className="search-tabs"><button className="active">Query vector</button><button title="A server-side embedding provider is required" onClick={()=>setError('Text search needs a compatible embedding provider on a backend. No query vector is fabricated.')}>Text query <span className="lock">⌑</span></button></div></div>
           <div className="dock-controls"><div className="query-entry"><textarea value={queryVector} onChange={e=>setQueryVector(e.target.value)} placeholder={records.length?`Paste ${dim} values, e.g. [0.12, 0.45, 0.89]`:'Import vectors to enable similarity search'} disabled={!records.length} aria-label="Query vector"/><button className="button primary search-button" disabled={!records.length||!queryVector.trim()} onClick={()=>runSearch()}>Search <span>⌕</span></button></div><div className="search-options"><label>Metric<select value={metric} onChange={e=>{const next=e.target.value as Metric;setMetric(next);setThreshold(next==='euclidean'?1000000000:-1)}}><option value="cosine">Cosine similarity</option><option value="euclidean">Euclidean distance</option><option value="dot">Dot product</option></select></label><label>Top K<select value={topK} onChange={e=>setTopK(Number(e.target.value))}><option>5</option><option>10</option><option>20</option><option>50</option></select></label><label>{metric==='euclidean'?'Max distance':'Min score'}<input type="number" step="0.05" value={threshold} onChange={e=>setThreshold(Number(e.target.value))}/></label></div></div>
-          {results.length===0&&history.length>0&&<div className="history-wrap"><div className="history-heading">Recent searches <button className="text-button" onClick={()=>setHistory([])}>Clear</button></div>{history.slice(0,3).map((item,i)=><button className="history-row" key={`${item.time}-${i}`} onClick={()=>{setQueryVector(item.query);setMetric(item.metric)}}><span>⌕</span><b>{item.query.slice(0,34)}</b><small>{item.metric} · {item.count} results · {item.time}</small><em>Use again</em></button>)}</div>}          {results.length>0&&<div className="results-wrap"><div className="results-heading"><div><strong>{results.length} nearest records</strong><small>Ranked by {metric} · original {dim}D vectors</small></div><button className="text-button" onClick={exportResults}>Export CSV ⇩</button><button className="icon-button tiny" onClick={()=>setResults([])} aria-label="Clear results">×</button></div><div className="result-list">{results.map(result=><button key={result.record.id} className={selected===result.record.id?'result-row selected':'result-row'} onClick={()=>setSelected(result.record.id)}><span className="rank">{String(result.rank).padStart(2,'0')}</span><span className="result-copy"><b>{result.record.id}</b><small>{result.record.text||'No text field'}</small></span><span className="result-category">{result.record.metadata[activeField]??'—'}</span><strong className="score">{formatNumber(result.score,4)}</strong><span className="open-arrow">↗</span></button>)}</div></div>}
+          {results.length===0&&history.length>0&&<div className="history-wrap"><div className="history-heading">Recent searches <button className="text-button" onClick={()=>setHistory([])}>Clear</button></div>{history.slice(0,3).map((item,i)=><button className="history-row" key={`${item.time}-${i}`} onClick={()=>{setQueryVector(item.query);setMetric(item.metric)}}><span>⌕</span><b>{item.query.slice(0,34)}</b><small>{item.metric} · {item.count} results · {item.time}</small><em>Use again</em></button>)}</div>}          {results.length>0&&<div className="results-wrap"><div className="results-heading"><div><strong>{results.length} nearest records</strong><small>Ranked by {metric} · original {dim}D vectors</small></div><button className="text-button" onClick={exportResults}>Export CSV ⇩</button><button className="icon-button tiny" onClick={()=>{setResults([]);setIsolateMatches(false)}} aria-label="Clear results">×</button></div><div className="result-list">{results.map(result=><button key={result.record.id} className={selected===result.record.id?'result-row selected':'result-row'} onClick={()=>setSelected(result.record.id)}><span className="rank">{String(result.rank).padStart(2,'0')}</span><span className="result-copy"><b>{result.record.id}</b><small>{result.record.text||'No text field'}</small></span><span className="result-category">{result.record.metadata[activeField]??'—'}</span><strong className="score">{formatNumber(result.score,4)}</strong><span className="open-arrow">↗</span></button>)}</div></div>}
         </section>
         </>:mode==='admin'?<AdminDashboard records={records} datasetName={datasetName} issues={issues} history={history} onImport={()=>fileRef.current?.click()} onExplore={()=>{setMode('analytics');setNav('Embedding Explorer')}}/>:<SupportDashboard records={records} issues={issues} onImport={()=>fileRef.current?.click()} onDownload={downloadIssues}/>}</main>
       <aside className={mode==='analytics'&&picked?'right-panel inspector-drawer open':'right-panel inspector-drawer'} aria-label="Selected record details">
@@ -181,7 +321,7 @@ export default function App() {
         {picked?<><div className="record-id-row"><span className="record-dot"></span><div><small>RECORD ID</small><strong>{picked.id}</strong></div><button className="copy-button" onClick={()=>navigator.clipboard?.writeText(picked.id)} title="Copy ID">▢</button></div><div className="inspector-scroll">
           <div className="inspector-section"><label>CONTENT</label><p className="record-text">{picked.text||'No text or content column was mapped.'}</p></div>
           <div className="inspector-section"><label>METADATA</label>{Object.entries(picked.metadata).filter(([k,v])=>v&&k!=='source').length?<div className="metadata-list">{Object.entries(picked.metadata).filter(([k,v])=>v&&k!=='source').map(([key,value])=><div key={key}><span>{key}</span><b>{value}</b></div>)}</div>:<p className="quiet">No metadata fields were imported.</p>}</div>
-          <div className="inspector-section"><label>VECTOR PROFILE</label><div className="profile-grid"><div><small>Original dimensions</small><b>{picked.embedding.length}</b></div><div><small>Vector norm</small><b>{formatNumber(picked.norm,4)}</b></div><div><small>CSV row</small><b>{picked.row}</b></div>{resultById.has(picked.id)&&<div><small>Search rank</small><b>#{resultById.get(picked.id)?.rank} · {formatNumber(resultById.get(picked.id)!.score,4)}</b></div>}</div><p className="coordinate-note">Original vector and projected coordinates are distinct. The values below are the PCA display position.</p><div className="coord-row">{['x','y','z'].map(axis=><div key={axis}><small>PC {axis.toUpperCase()}</small><b>{formatNumber((projectionById.get(picked.id) as any)?.[axis]??0,4)}</b></div>)}</div><details className="vector-details"><summary>Original vector preview <span>{picked.embedding.length} values</span></summary><code>{picked.embedding.slice(0,18).map(n=>formatNumber(n,4)).join(', ')}{picked.embedding.length>18?' …':''}</code></details><button className="text-button use-vector" onClick={()=>{setQueryVector(JSON.stringify(picked.embedding));document.querySelector('.query-entry textarea')?.scrollIntoView({behavior:'smooth',block:'center'})}}>Use this vector as a query ↓</button></div>          <div className="inspector-section neighbors-section"><label>NEAREST RECORDS <span>· {metric}</span></label>{selectedNeighbors.map(({r,score})=><button key={r.id} className="neighbor-row" onClick={()=>setSelected(r.id)}><span className="neighbor-dot"></span><span><b>{r.id}</b><small>{r.text}</small></span><strong>{formatNumber(score,3)}</strong></button>)}</div>
+          <div className="inspector-section"><label>VECTOR PROFILE</label><div className="profile-grid"><div><small>Original dimensions</small><b>{picked.embedding.length}</b></div><div><small>Vector norm</small><b>{formatNumber(picked.norm,4)}</b></div><div><small>CSV row</small><b>{picked.row}</b></div>{resultById.has(picked.id)&&<div><small>Search rank</small><b>#{resultById.get(picked.id)?.rank} · {formatNumber(resultById.get(picked.id)!.score,4)}</b></div>}</div><p className="coordinate-note">Original vector and projected coordinates are distinct. The values below are the PCA display position.</p><div className="coord-row">{['x','y','z'].map(axis=><div key={axis}><small>PC {axis.toUpperCase()}</small><b>{formatNumber((originalProjectionById.get(picked.id) as any)?.[axis]??0,4)}</b></div>)}</div><details className="vector-details"><summary>Original vector preview <span>{picked.embedding.length} values</span></summary><code>{picked.embedding.slice(0,18).map(n=>formatNumber(n,4)).join(', ')}{picked.embedding.length>18?' …':''}</code></details><button className="text-button use-vector" onClick={()=>{setQueryVector(JSON.stringify(picked.embedding));document.querySelector('.query-entry textarea')?.scrollIntoView({behavior:'smooth',block:'center'})}}>Use this vector as a query ↓</button></div>          <div className="inspector-section neighbors-section"><label>NEAREST RECORDS <span>· {metric}</span></label>{selectedNeighbors.map(({r,score})=><button key={r.id} className="neighbor-row" onClick={()=>setSelected(r.id)}><span className="neighbor-dot"></span><span><b>{r.id}</b><small>{r.text}</small></span><strong>{formatNumber(score,3)}</strong></button>)}</div>
         </div></>:<div className="inspector-empty"><div className="crosshair">＋</div><strong>Nothing selected</strong><p>Choose a point in the map or a result to inspect its source record and original vector.</p><div className="inspect-tip"><span>⌖</span><p>Projected coordinates are for display. Similarity is always calculated from the original vectors.</p></div></div>}
         <div className="inspector-bottom"><div className="data-status"><span className="status-check">✓</span><span><b>Local processing</b><small>Vectors remain in this browser session</small></span></div><button className="more-action" title="Data management" onClick={()=>setNav('Data Management')}>···</button></div>
       </aside>
@@ -193,22 +333,3 @@ export default function App() {
     {drag&&<div className="global-drop"><div><strong>Drop CSV to start import</strong><span>CSV files are parsed locally</span></div></div>}
   </div>
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

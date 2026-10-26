@@ -242,3 +242,35 @@ body{background:#eeeae0}
   .app :where(.role-view section.grid){gap:20px}
 }
 @media(prefers-reduced-motion:reduce){.app :where(button,a,select,input,textarea,summary){transition:none!important}}
+
+/* Fixed-Y orbit control: point coordinates rotate in data space, not by rolling the camera. */
+.axis-rotation-control{display:grid;grid-template-columns:max-content minmax(80px,1fr) max-content max-content;align-items:center;gap:9px;margin:4px 0 6px;padding:0 2px;color:var(--muted);font-size:11px}
+.axis-rotation-control label{font-weight:600;color:var(--text);white-space:nowrap}
+.axis-rotation-control input[type=range]{width:100%;min-width:80px;height:40px;margin:0;accent-color:var(--accent);cursor:ew-resize;touch-action:pan-y}
+.axis-rotation-control output{min-width:36px;text-align:right;color:var(--text);font:11px 'Cascadia Code','Consolas',monospace;font-variant-numeric:tabular-nums}
+.axis-rotation-control .text-button{min-width:44px;min-height:40px;padding:0 8px;font-size:11px}
+@media(max-width:760px){.axis-rotation-control{grid-template-columns:max-content minmax(72px,1fr) max-content max-content;gap:6px;margin:3px 0 5px;padding:0 1px;font-size:10px}.axis-rotation-control label{font-size:10px}.axis-rotation-control output{min-width:32px;font-size:10px}.axis-rotation-control .text-button{min-width:40px;padding:0 6px;font-size:10px}.axis-rotation-control input[type=range]{min-width:72px}}
+/* Dense-science graph mode: one shared panel keeps the header, axes and plot together in full screen. */
+.visualization-panel{min-width:0;position:relative}
+.visualization-panel:fullscreen{width:100vw;height:100dvh;min-height:0;display:flex;flex-direction:column;overflow:auto;padding:clamp(12px,2vw,24px);background:var(--bg);color:var(--text)}
+.visualization-panel:fullscreen .viz-bar{margin-top:0;flex:0 0 48px}
+.visualization-panel:fullscreen .axis-rotation-control{flex:0 0 auto;margin-block:8px}
+.visualization-panel:fullscreen .plot-shell{flex:1 1 auto;min-height:0;border-radius:8px}
+.visualization-panel:fullscreen .workspace-footer{flex:0 0 38px}
+.visualization-panel:fullscreen .plot-hint{bottom:14px}
+.visualization-panel :where(.icon-button:focus-visible,.axis-rotation-control input:focus-visible,.axis-rotation-control button:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+.visualization-panel .plot-shell{cursor:grab;touch-action:none}
+.visualization-panel .plot-shell:active{cursor:grabbing}
+@media(max-width:760px){
+  .visualization-panel:fullscreen{padding:8px}
+  .visualization-panel:fullscreen .viz-bar{height:auto;min-height:44px;flex-basis:auto;margin:0}
+  .visualization-panel:fullscreen .viz-mode{min-width:0;gap:7px}
+  .visualization-panel:fullscreen .viz-actions{gap:5px}
+  .visualization-panel:fullscreen .workspace-footer{height:auto;min-height:30px;flex-basis:auto}
+}
+.visualization-panel .viz-actions .icon-button{width:40px;height:40px}
+.visualization-panel .isolation-toggle{min-width:92px;height:36px;padding-inline:10px;white-space:nowrap}
+@media(max-width:760px){.visualization-panel .isolation-toggle{width:auto;min-width:82px;height:34px;padding-inline:7px;font-size:10px}}
+.visualization-panel .isolation-toggle{color:var(--accent);border-color:var(--accent-deep);background:var(--surface2)}
+.visualization-panel .isolation-toggle:hover{color:var(--text);background:var(--surface3)}
+.visualization-panel .plot-shell{overscroll-behavior:contain}
