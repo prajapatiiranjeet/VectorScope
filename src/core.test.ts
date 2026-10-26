@@ -6,10 +6,13 @@ describe('safe vector parsing',()=>{
   it('rejects empty, malformed, and non-finite values',()=>{expect(()=>parseVector('')).toThrow();expect(()=>parseVector('[1, nope]')).toThrow();expect(()=>parseVector('1,,3')).toThrow();expect(()=>parseVector('[1, NaN]')).toThrow()})
 })
 describe('CSV row validation',()=>{
-  const headers=['id','text','embedding_0','embedding_1']
-  const config={id:'id',text:'text',vector:'',dims:['embedding_0','embedding_1']}
-  it('keeps valid source rows and reports missing numeric dimensions',()=>{const result=parseRows([{id:'a',text:'alpha',embedding_0:'1',embedding_1:'0'},{id:'b',text:'beta',embedding_0:'',embedding_1:'2'}],headers,config);expect(result.records).toHaveLength(1);expect(result.issues[0]).toContain('Row 3')})
-  it('reports duplicate IDs and inconsistent dimensions',()=>{const a=parseRows([{id:'x',text:'x',embedding_0:'1',embedding_1:'0'},{id:'x',text:'dup',embedding_0:'2',embedding_1:'1'}],headers,config);expect(a.issues[0]).toContain('duplicate');const b=parseRows([{id:'a',text:'a',embedding:'[1,2]'} as any,{id:'b',text:'b',embedding:'[1,2,3]'} as any],['id','text','embedding'],{id:'id',text:'text',vector:'embedding',dims:[]});expect(b.records).toHaveLength(1);expect(b.issues[0]).toContain('dimensions')})
+  const headers=['id','text',...Array.from({length:384},(_,i)=>`embedding_${i}`)]
+  const dims=headers.slice(2)
+  const config={id:'id',text:'text',vector:'',dims}
+  const vectorRow=(id:string, values:number[])=>Object.fromEntries([['id',id],['text',id],...dims.map((key,i)=>[key,String(values[i]??0)])]) as Record<string,string>
+  it('accepts exactly 384 numeric dimensions and reports missing values',()=>{const valid=vectorRow('a',[1]);const invalid=vectorRow('b',[1]);invalid.embedding_10='';const result=parseRows([valid,invalid],headers,config);expect(result.records).toHaveLength(1);expect(result.records[0].embedding).toHaveLength(384);expect(result.issues[0]).toContain('Row 3')})
+  it('rejects vectors that are not exactly 384 dimensions',()=>{const result=parseRows([{id:'short',text:'short',embedding:'[1,2]'} as any,{id:'long',text:'long',embedding:`[${Array(385).fill(1).join(',')}]`} as any],['id','text','embedding'],{id:'id',text:'text',vector:'embedding',dims:[]});expect(result.records).toHaveLength(0);expect(result.issues[0]).toContain('expected exactly 384');expect(result.issues[1]).toContain('expected exactly 384')})
+  it('reports duplicate IDs',()=>{const result=parseRows([vectorRow('x',[1]),vectorRow('x',[2])],headers,config);expect(result.records).toHaveLength(1);expect(result.issues[0]).toContain('duplicate')})
 })
 describe('exact similarity search',()=>{
  const records=[row('same',[1,0]),row('diagonal',[1,1]),row('opposite',[-1,0]),row('orthogonal',[0,1])]

@@ -1,3 +1,4 @@
+export const REQUIRED_EMBEDDING_DIMENSIONS = 384
 export type RecordRow = { id: string; text: string; embedding: number[]; metadata: Record<string, string>; row: number; norm: number }
 export type Metric = 'cosine' | 'euclidean' | 'dot'
 export type Ranked = { record: RecordRow; score: number; rank: number }
@@ -46,6 +47,7 @@ export function parseRows(rows: Record<string, string>[], headers: string[], con
     try { embedding = config.vector ? parseVector(String(source[config.vector] ?? '')) : config.dims.map((key) => String(source[key] ?? '').trim() ? Number(source[key]) : Number.NaN) }
     catch (error) { issues.push(`Row ${rowNumber}: ${(error as Error).message}`); return }
     if (!embedding.length || embedding.some((n) => !Number.isFinite(n))) { issues.push(`Row ${rowNumber}: embedding contains a missing, non-numeric, or non-finite value.`); return }
+    if (embedding.length !== REQUIRED_EMBEDDING_DIMENSIONS) { issues.push(`Row ${rowNumber}: expected exactly ${REQUIRED_EMBEDDING_DIMENSIONS} dimensions but found ${embedding.length}.`); return }
     if (records.length && embedding.length !== records[0].embedding.length) { issues.push(`Row ${rowNumber}: expected ${records[0].embedding.length} dimensions but found ${embedding.length}.`); return }
     const metadata = Object.fromEntries(headers.filter((h) => h !== config.id && h !== config.text && h !== config.vector && !config.dims.includes(h)).map((h) => [h, String(source[h] ?? '')]))
     records.push({ id, text: String(source[config.text] ?? ''), embedding, metadata, row: rowNumber, norm: norm(embedding) })
